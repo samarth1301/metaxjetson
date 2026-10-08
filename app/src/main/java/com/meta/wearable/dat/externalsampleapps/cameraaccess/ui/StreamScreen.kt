@@ -69,6 +69,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -83,6 +84,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -153,6 +155,13 @@ fun StreamScreen(
   var assistantDock by remember { mutableStateOf(AssistantDock.BOTTOM) }
   var isStreamHudExpanded by remember { mutableStateOf(false) }
 
+  // The screen timing out sends the app to the background, which pauses/ends the raw glasses
+  // stream. Keep the display on for as long as the stream screen is shown.
+  val view = LocalView.current
+  DisposableEffect(view) {
+    view.keepScreenOn = true
+    onDispose { view.keepScreenOn = false }
+  }
   LaunchedEffect(Unit) { streamViewModel.startStream() }
   LaunchedEffect(Unit) {
     assistantViewModel.onAnswerReady = { answer -> streamViewModel.speakQnaResponse(answer) }

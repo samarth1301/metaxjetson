@@ -20,6 +20,9 @@
 
     <!-- Stream Screen -->
     <string name="live_stream" description="Live Stream">Live stream</string>
+    <string name="streaming_notification_channel_name" description="Notification channel for the active glasses stream">Glasses streaming</string>
+    <string name="streaming_notification_title" description="Ongoing streaming notification title">WF Meta is streaming</string>
+    <string name="streaming_notification_body" description="Ongoing streaming notification body">Your glasses session stays active while the screen is off.</string>
 
     <!-- Non Stream Screen -->
     <string name="camera_access_icon_description" description="WF Meta icon description">WF Meta icon</string>

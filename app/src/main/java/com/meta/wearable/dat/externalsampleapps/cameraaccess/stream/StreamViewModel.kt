@@ -97,6 +97,10 @@ class StreamViewModel(
     private const val DOCUMENT_QA_MIC_HANDOFF_DELAY_MS = 400L
     private const val POST_TTS_COOLDOWN_MS = 600L
     private const val TTS_READY_TIMEOUT_MS = 3_000L
+    // HIGH (720x1280) heats the glasses into THERMAL_HOT within minutes and allocates ~3.7MB per
+    // frame on the phone. Document scans use capturePhoto(), so preview quality does not affect OCR.
+    private val STREAM_VIDEO_QUALITY = VideoQuality.MEDIUM
+    private const val STREAM_FRAME_RATE = 15
   }
 
   private enum class DocumentScanTrigger(
@@ -137,6 +141,7 @@ class StreamViewModel(
   private var stream: Stream? = null
   private var audioStream: AudioStream? = null
   private var previousDeviceSessionState: DeviceSessionState? = null
+  private var sessionStartedAtMs = 0L
 
   // Buffer for recording audio frames
   // Buffer for recording audio frames
@@ -184,16 +189,17 @@ class StreamViewModel(
             onFrameReady = { frame ->
               // This is called from the presentation thread at regular intervals
               // when a frame's presentation time has arrived
-              viewModelScope.launch(Dispatchers.Main) {
-                _uiState.update {
-                  it.copy(videoFrame = frame.bitmap, videoFrameCount = it.videoFrameCount + 1)
-                }
+              // StateFlow.update is thread-safe; no need to launch a coroutine per frame.
+              _uiState.update {
+                it.copy(videoFrame = frame.bitmap, videoFrameCount = it.videoFrameCount + 1)
               }
               scheduleFaceRecognition(frame.bitmap)
             },
         )
     presentationQueue = queue
     queue.start()
+    sessionStartedAtMs = SystemClock.elapsedRealtime()
+    StreamingService.start(getApplication())
     if (session == null) {
       previousDeviceSessionState = null
       Wearables.createSession(deviceSelector)
@@ -219,6 +225,7 @@ class StreamViewModel(
       session?.state?.collect { currentState ->
         val prevState = previousDeviceSessionState
         previousDeviceSessionState = currentState
+        Log.i(TAG, "Device session state: $prevState -> $currentState after ${sessionElapsedSeconds()}s")
 
         if (currentState == DeviceSessionState.STARTED) {
           if (WearablesUpdatePolicy.clearsDatAppUpdate(currentState)) {
@@ -238,10 +245,17 @@ class StreamViewModel(
           stream?.stop()
           stream = null
           session
-              ?.addStream(StreamConfiguration(videoQuality = VideoQuality.HIGH, frameRate = 15))
+              ?.addStream(
+                  StreamConfiguration(
+                      videoQuality = STREAM_VIDEO_QUALITY,
+                      frameRate = STREAM_FRAME_RATE,
+                  )
+              )
               ?.onSuccess { addedStream ->
                 stream = addedStream
-                videoJob = viewModelScope.launch {
+                // I420 -> ARGB conversion is ~1M pixels per frame; keep it off the main thread so
+                // the UI thread is not saturated (jank, ANRs, frame backlog).
+                videoJob = viewModelScope.launch(Dispatchers.Default) {
                   Log.d(TAG, "Collecting video frames from stream")
                   stream?.videoStream?.collect { handleVideoFrame(it) }
                   Log.d(TAG, "Video stream collection ended")
@@ -264,7 +278,10 @@ class StreamViewModel(
                 stateJob = viewModelScope.launch {
                   stream?.state?.collect { streamState ->
                     val prevStreamState = _uiState.value.streamState
-                    Log.d(TAG, "Stream state changed: $prevStreamState -> $streamState")
+                    Log.i(
+                        TAG,
+                        "Stream state changed: $prevStreamState -> $streamState after ${sessionElapsedSeconds()}s",
+                    )
                     _uiState.update { it.copy(streamState = streamState) }
 
                     val wasActive = prevStreamState !in SESSION_TERMINAL_STATES
@@ -278,9 +295,16 @@ class StreamViewModel(
                 }
                 errorJob = viewModelScope.launch {
                   stream?.errorStream?.collect { error ->
-                    Log.d(TAG, "Stream error received: $error (description: ${error.description})")
-                    if (error == StreamError.STREAM_ERROR) {
-                      Log.d(TAG, "Non-critical error, stream continues")
+                    Log.w(
+                        TAG,
+                        "Stream error received after ${sessionElapsedSeconds()}s: $error (${error.description})",
+                    )
+                    if (!StreamErrorPolicy.isTerminal(error)) {
+                      // Warnings (thermal, battery, timeout) do not end the session; if the glasses
+                      // actually stop, the stream reaches CLOSED and stateJob navigates back.
+                      if (error != StreamError.STREAM_ERROR) {
+                        wearablesViewModel.setRecentError(error.description)
+                      }
                       return@collect
                     }
                     stopStream()
@@ -303,6 +327,8 @@ class StreamViewModel(
   }
 
   fun stopStream(onComplete: (Boolean) -> Unit = {}) {
+    Log.i(TAG, "Stopping stream after ${sessionElapsedSeconds()}s")
+    StreamingService.stop(getApplication())
     videoJob?.cancel()
     videoJob = null
     audioJob?.cancel()
@@ -344,7 +370,6 @@ class StreamViewModel(
     if (hasAudio) {
       _uiState.update { it.copy(isAudioPlaybackVisible = true) }
     }
-    glassesSpeechEngine.shutdown()
     onComplete(hasAudio)
   }
 
@@ -362,10 +387,14 @@ class StreamViewModel(
     )
   }
 
+  private fun sessionElapsedSeconds(): Long =
+      if (sessionStartedAtMs == 0L) 0L
+      else (SystemClock.elapsedRealtime() - sessionStartedAtMs) / 1000
+
   private fun handleSessionError(error: DeviceSessionError) {
     Log.e(
         TAG,
-        "Session error: type=$error, lastState=$previousDeviceSessionState, description=${error.description}",
+        "Session error after ${sessionElapsedSeconds()}s: type=$error, lastState=$previousDeviceSessionState, description=${error.description}",
     )
     if (WearablesUpdatePolicy.requiresDatAppUpdate(error)) {
       wearablesViewModel.setDatAppUpdateRequired(true)
@@ -1276,6 +1305,7 @@ class StreamViewModel(
     stopStream()
     session?.stop()
     session = null
+    glassesSpeechEngine.shutdown()
   }
 
   class Factory(
