@@ -8,15 +8,15 @@ import com.meta.wearable.dat.camera.types.StreamError
  * Warnings such as THERMAL_HOT, BATTERY_LOW, PEAK_POWER_LIMIT and TIMEOUT are reported while the
  * glasses keep streaming (or throttle). Tearing the session down on them is what made sessions end
  * abruptly after a few minutes of warm-up. If the glasses really do stop, the stream state reaches
- * CLOSED and the state collector navigates back.
+ * CLOSED and the state collector navigates back. THERMAL_EMERGENCY is no longer a stream error in
+ * SDK 1.0.1; it arrives as a DeviceSessionError, which always ends the session.
  */
 internal object StreamErrorPolicy {
   fun isTerminal(error: StreamError): Boolean =
       when (error) {
         StreamError.CRITICAL_STREAM_ERROR,
         StreamError.HINGE_CLOSED,
-        StreamError.PERMISSIONS_DENIED,
-        StreamError.THERMAL_EMERGENCY -> true
+        StreamError.PERMISSIONS_DENIED -> true
         StreamError.STREAM_ERROR,
         StreamError.THERMAL_HOT,
         StreamError.BATTERY_LOW,

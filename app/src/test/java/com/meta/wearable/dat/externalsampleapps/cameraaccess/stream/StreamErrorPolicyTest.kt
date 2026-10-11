@@ -20,6 +20,5 @@ class StreamErrorPolicyTest {
     assertTrue(StreamErrorPolicy.isTerminal(StreamError.CRITICAL_STREAM_ERROR))
     assertTrue(StreamErrorPolicy.isTerminal(StreamError.HINGE_CLOSED))
     assertTrue(StreamErrorPolicy.isTerminal(StreamError.PERMISSIONS_DENIED))
-    assertTrue(StreamErrorPolicy.isTerminal(StreamError.THERMAL_EMERGENCY))
   }
 }

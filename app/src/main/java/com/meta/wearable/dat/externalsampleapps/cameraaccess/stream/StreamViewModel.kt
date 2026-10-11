@@ -34,8 +34,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.meta.wearable.dat.camera.Camera
 import com.meta.wearable.dat.camera.Stream
-import com.meta.wearable.dat.camera.addStream
+import com.meta.wearable.dat.camera.addCamera
 import com.meta.wearable.dat.camera.types.PhotoData
 import com.meta.wearable.dat.camera.types.StreamConfiguration
 import com.meta.wearable.dat.camera.types.StreamError
@@ -71,6 +72,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -101,6 +103,9 @@ class StreamViewModel(
     // frame on the phone. Document scans use capturePhoto(), so preview quality does not affect OCR.
     private val STREAM_VIDEO_QUALITY = VideoQuality.MEDIUM
     private const val STREAM_FRAME_RATE = 15
+    // Live detection needs the newest frame, not a queue. Keep at most two frames in flight.
+    private const val PRESENTATION_BUFFER_MS = 0L
+    private const val PRESENTATION_MAX_QUEUE = 2
   }
 
   private enum class DocumentScanTrigger(
@@ -121,6 +126,9 @@ class StreamViewModel(
   private val documentAiService: DocumentAiService = DocumentAiService(application)
   private val faceRecognitionService: FaceRecognitionService = FaceRecognitionService(application)
   private var session: DeviceSession? = null
+  private var camera: Camera? = null
+  private val deliveryClock = DeliveryClock()
+  private val videoPipelineStats = VideoPipelineStats(log = { Log.i(TAG, it) })
 
   private val _uiState = MutableStateFlow(INITIAL_STATE)
   val uiState: StateFlow<StreamUiState> = _uiState.asStateFlow()
@@ -182,10 +190,12 @@ class StreamViewModel(
 
     // Initialize presentation queue - frames are presented based on timestamp, not arrival time
     // Uses IntArray pooling for efficiency - cheaper than Bitmap.copy()
+    deliveryClock.reset()
+    videoPipelineStats.reset()
     val queue =
         PresentationQueue(
-            bufferDelayMs = 100L,
-            maxQueueSize = 15,
+            bufferDelayMs = PRESENTATION_BUFFER_MS,
+            maxQueueSize = PRESENTATION_MAX_QUEUE,
             onFrameReady = { frame ->
               // This is called from the presentation thread at regular intervals
               // when a frame's presentation time has arrived
@@ -242,22 +252,30 @@ class StreamViewModel(
           videoJob?.cancel()
           stateJob?.cancel()
           errorJob?.cancel()
-          stream?.stop()
+          // Stopping the camera also stops its stream. SDK 1.0 rejects a second addCamera() while
+          // the previous camera is still attached.
+          camera?.stop()
+          camera = null
           stream = null
           session
-              ?.addStream(
+              ?.addCamera(
                   StreamConfiguration(
                       videoQuality = STREAM_VIDEO_QUALITY,
                       frameRate = STREAM_FRAME_RATE,
+                      compressVideo = false,
                   )
               )
-              ?.onSuccess { addedStream ->
+              ?.onSuccess { addedCamera ->
+                camera = addedCamera
+                val addedStream = addedCamera.stream
                 stream = addedStream
                 // I420 -> ARGB conversion is ~1M pixels per frame; keep it off the main thread so
                 // the UI thread is not saturated (jank, ANRs, frame backlog).
                 videoJob = viewModelScope.launch(Dispatchers.Default) {
                   Log.d(TAG, "Collecting video frames from stream")
-                  stream?.videoStream?.collect { handleVideoFrame(it) }
+                  // conflate() keeps only the newest frame when conversion falls behind, so a slow
+                  // frame never builds a backlog that shows up as lag on screen.
+                  addedStream.videoStream.conflate().collect { handleVideoFrame(it) }
                   Log.d(TAG, "Video stream collection ended")
                 }
 
@@ -358,7 +376,8 @@ class StreamViewModel(
           documentAnalysisPartial = null,
       )
     }
-    stream?.stop()
+    camera?.stop()
+    camera = null
     stream = null
     audioStream?.stop()
     audioStream = null
@@ -1062,6 +1081,8 @@ class StreamViewModel(
   }
 
   private fun handleVideoFrame(videoFrame: VideoFrame) {
+    val arrivedAtMs = SystemClock.elapsedRealtime()
+    val driftMs = deliveryClock.driftMs(arrivedAtMs, videoFrame.presentationTimeUs)
     // VideoFrame contains raw I420 video data in a ByteBuffer
     // Use optimized YuvToBitmapConverter for direct I420 to ARGB conversion
     val bitmap =
@@ -1070,6 +1091,12 @@ class StreamViewModel(
             videoFrame.width,
             videoFrame.height,
         )
+    val convertedAtMs = SystemClock.elapsedRealtime()
+    videoPipelineStats.onFrame(
+        nowMs = convertedAtMs,
+        convertMs = convertedAtMs - arrivedAtMs,
+        driftMs = driftMs,
+    )
     if (bitmap != null) {
       presentationQueue?.enqueue(
           bitmap,
